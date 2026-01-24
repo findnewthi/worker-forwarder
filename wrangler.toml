@@ -1,1 +1,12 @@
 
+name = "relay"
+main = "worker.js"
+compatibility_date = "2025-09-01"
+keep_vars = true
+
+#[[kv_namespaces]]
+#binding = "KV_CONFIG"
+#id = "xxxxxxxxxxxxxxxxxxxx"
+
+#[triggers]
+#crons = ["0 * * * *"]
