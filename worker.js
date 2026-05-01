@@ -1,9 +1,25 @@
 /**
- * @param {import("@cloudflare/workers-types").Request} request
- * @param {{KV_CONFIG: import("@cloudflare/workers-types").KVNamespace}} env
- * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
- * @returns {Promise<Response>}
+ * @param {Request} request
+ * @param {{
+ *   HOSTMAP_URL?: string,
+ *   PASSWORD?: string,
+ *   CLOUDFLARE_API_URL?: string,
+ *   CLOUDFLARE_API_KEY?: string
+ * }} env
+ * @param {ExecutionContext} ctx
  */
+ 
+const HOSTMAP_CACHE_TTL = 600; // 单位：秒
+const ROUTE_TARGET_HEADER = "Route-Target-Cf-My";
+const ROUTE_PASSWORD_HEADER = "Route-Password-Cf-My";
+
+const GLOBAL_CONFIG = {
+  HOSTMAP_URL: "",
+  PASSWORD: "",
+  CLOUDFLARE_API_URL: "",
+  CLOUDFLARE_API_KEY: "",
+};
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -14,20 +30,17 @@ export default {
         return handleOptions();
       }
 
-      // 单次请求内 KV 懒加载（带缓存）
-      const kv = createKvLazy(env);
-
       // --- 路由分发：fetch 内只做判断 ---
       if (url.pathname === "/hostmap/update" && request.method === "GET") {
-        return handleHostmapUpdate(url, kv, env);
+        return handleHostmapUpdate(url, env);
       }
 
       if (url.pathname === "/hostmap" && request.method === "GET") {
-        return handleHostmapGet(url, kv);
+        return handleHostmapGet(url, env);
       }
 
       // 默认：转发逻辑（兼容 WS）
-      return handleProxy(request, url, kv);
+      return handleProxy(request, url, env);
     } catch (error) {
       return textResponse(`服务器错误: ${error?.message ?? String(error)}`, 500);
     }
@@ -58,14 +71,18 @@ function handleOptions() {
 /**
  * /hostmap/update?password=xxx
  * @param {URL} url
- * @param {ReturnType<typeof createKvLazy>} kv
- * @param {{KV_CONFIG: import("@cloudflare/workers-types").KVNamespace}} env
+ * @param {{
+ *   HOSTMAP_URL?: string,
+ *   PASSWORD?: string,
+ *   CLOUDFLARE_API_URL?: string,
+ *   CLOUDFLARE_API_KEY?: string
+ * }} env
  */
-async function handleHostmapUpdate(url, kv, env) {
+async function handleHostmapUpdate(url, env) {
   const inputPassword = url.searchParams.get("password");
-  const password = await kv.getPassword();
+  const password = getConfigValue(env, "PASSWORD");
 
-  if (!password) return textResponse("KV中未找到password配置", 500);
+  if (!password) return textResponse("未找到password配置", 500);
   if (inputPassword !== password) return new Response(null, { status: 403 });
 
   try {
@@ -79,58 +96,77 @@ async function handleHostmapUpdate(url, kv, env) {
 /**
  * /hostmap?password=xxx
  * @param {URL} url
- * @param {ReturnType<typeof createKvLazy>} kv
+ * @param {{
+ *   HOSTMAP_URL?: string,
+ *   PASSWORD?: string,
+ *   CLOUDFLARE_API_URL?: string,
+ *   CLOUDFLARE_API_KEY?: string
+ * }} env
  */
-async function handleHostmapGet(url, kv) {
+async function handleHostmapGet(url, env) {
   const inputPassword = url.searchParams.get("password");
-  const password = await kv.getPassword();
+  const password = getConfigValue(env, "PASSWORD");
 
-  if (!password) return textResponse("KV中未找到password配置", 500);
+  if (!password) return textResponse("未找到password配置", 500);
   if (inputPassword !== password) return new Response(null, { status: 403 });
 
-  const hostmap = await kv.getHostmap();
-  if (!hostmap) return textResponse("KV中未找到hostmap配置或格式错误", 500);
-
-  return new Response(JSON.stringify(hostmap, null, 2), {
-    headers: { "Content-Type": "application/json; charset=UTF-8" },
-  });
+  try {
+    // 使用 fetchHostmap：先读缓存，无则更新再读
+    const hostmap = await fetchHostmap(env);
+    const customDomains = await fetchCustomDomains(env);
+    const payload = {
+      hostmaps: hostmap,
+      custom_domains: customDomains,
+    };
+    return new Response(JSON.stringify(payload, null, 2), {
+      headers: { "Content-Type": "application/json; charset=UTF-8" },
+    });
+  } catch (e) {
+    return textResponse(e?.message ?? String(e), 500);
+  }
 }
 
 /**
  * 转发入口：先判断是否强制路由；否则走 hostmap
  * @param {Request} request
  * @param {URL} url
- * @param {ReturnType<typeof createKvLazy>} kv
+ * @param {{
+ *   HOSTMAP_URL?: string,
+ *   PASSWORD?: string,
+ *   CLOUDFLARE_API_URL?: string,
+ *   CLOUDFLARE_API_KEY?: string
+ * }} env
  */
-async function handleProxy(request, url, kv) {
-  // ✅ 强制路由从 header 取（HTTP header 名不区分大小写）
-  const ROUTE_TARGET_HEADER = "Route-Target-Cf-My";
-  const ROUTE_PASSWORD_HEADER = "Route-Password-Cf-My";
-
+async function handleProxy(request, url, env) {
   const overrideTarget = request.headers.get(ROUTE_TARGET_HEADER);
   const overridePassword = request.headers.get(ROUTE_PASSWORD_HEADER);
 
+  // 先取 hostmap（任何错误都转成友好响应）
+  let hostmap;
+  try {
+    hostmap = await fetchHostmap(env);
+  } catch (e) {
+    return textResponse(`hostmap 不可用: ${e?.message ?? "未知错误"}`, 500);
+  }
+
   // 1) 强制路由：出现 ROUTE_TARGET_HEADER 才读 password 校验
   if (overrideTarget && overrideTarget.trim()) {
-    const password = await kv.getPassword();
-    if (!password) return textResponse("KV中未找到password配置", 500);
-
-    // 密码不对：直接 403（更安全）
+    const password = getConfigValue(env, "PASSWORD");
+    if (!password) return textResponse("未找到password配置", 500);
     if (overridePassword !== password) return new Response(null, { status: 403 });
 
-    const t = parseTarget(overrideTarget.trim());
+    const keyOrTarget = overrideTarget.trim();
+    const mapped = hostmap && (hostmap[keyOrTarget] ?? hostmap[keyOrTarget.toLowerCase()]);
+    const finalRawTarget = mapped ?? keyOrTarget;
+    const t = parseTarget(finalRawTarget);
 
-    // 强制路由：必须删除敏感 header（避免泄露）
     const stripHeaders = [ROUTE_TARGET_HEADER, ROUTE_PASSWORD_HEADER];
     return proxyToTarget(request, url, t, { stripHeaders });
   }
 
-  // 2) 非强制路由：此时才加载 hostmap
-  const hostmap = await kv.getHostmap();
-  if (!hostmap) return textResponse("KV中未找到hostmap配置或格式错误", 500);
-
-  const curhost = url.host;         // 可能含端口
-  const curhostname = url.hostname; // 不含端口
+  // 2) 非强制路由：用 hostmap 做映射
+  const curhost = url.host;
+  const curhostname = url.hostname;
   const rawTarget = hostmap[curhost] ?? hostmap[curhostname] ?? hostmap._default;
 
   if (!rawTarget) {
@@ -146,12 +182,7 @@ async function handleProxy(request, url, kv) {
 // =====================
 
 /**
- * 共用转发逻辑：HTTP + WebSocket 都能透传（直接 fetch(modifiedRequest)）
- *
- * @param {Request} request
- * @param {URL} url
- * @param {{ protocol: 'http'|'https', hostname: string, port: string|null }} target
- * @param {{ stripHeaders?: string[] }} [opts]
+ * 共用转发逻辑：HTTP + WebSocket 都能透传
  */
 async function proxyToTarget(request, url, target, opts = {}) {
   const targetUrl = new URL(url);
@@ -159,11 +190,10 @@ async function proxyToTarget(request, url, target, opts = {}) {
   targetUrl.hostname = target.hostname;
   targetUrl.port = target.port ?? "";
 
-  // 复制 headers，但删除 Host（让 fetch 根据 targetUrl 自动生成正确 Host）
   const headers = new Headers(request.headers);
   headers.delete("Host");
+  headers.set("Origin", `${targetUrl.protocol}//${targetUrl.hostname}`);
 
-  // 强制路由时：删除自定义敏感头（避免泄露）
   for (const h of opts.stripHeaders ?? []) headers.delete(h);
 
   const method = request.method;
@@ -177,59 +207,176 @@ async function proxyToTarget(request, url, target, opts = {}) {
   };
 
   const response = await fetch(new Request(targetUrl.toString(), init));
-
   const modifiedResponse = new Response(response.body, response);
   const ch = corsHeaders();
   for (const [k, v] of Object.entries(ch)) modifiedResponse.headers.set(k, v);
-
+  modifiedResponse.headers.delete("Link");
   return modifiedResponse;
 }
 
+// =====================
+// Hostmap 管理（核心改动）
+// =====================
 
-// =====================
-// KV lazy cache (per request)
-// =====================
+function normalizeUrl(u) {
+  const s = String(u).trim();
+  return s.endsWith("/") ? s.slice(0, -1) : s;
+}
+
+function getConfigValue(env, key) {
+  return env?.[key] || GLOBAL_CONFIG[key] || "";
+}
 
 /**
- * 单次请求内的 KV 懒加载缓存
- * @param {{KV_CONFIG: import("@cloudflare/workers-types").KVNamespace}} env
+ * 获取 hostmap：先读缓存，不存在则远程更新并重新读取
+ * @param {{
+ *   HOSTMAP_URL?: string,
+ *   PASSWORD?: string,
+ *   CLOUDFLARE_API_URL?: string,
+ *   CLOUDFLARE_API_KEY?: string
+ * }} env
+ * @returns {Promise<Object>}
  */
-function createKvLazy(env) {
-  /** @type {string|null|undefined} */
-  let _password;
-  /** @type {Record<string, string>|null|undefined} */
-  let _hostmap;
+async function fetchHostmap(env) {
+  const raw = getConfigValue(env, "HOSTMAP_URL");
+  if (!raw) throw new Error("HOSTMAP_URL 未配置");
 
-  return {
-    async getPassword() {
-      if (_password !== undefined) return _password;
-      _password = await env.KV_CONFIG.get("password", { type: "text" });
-      return _password;
+  let mapUrl;
+  try {
+    mapUrl = normalizeUrl(raw);
+    new URL(mapUrl); // 校验必须是合法绝对 URL
+  } catch {
+    throw new Error("HOSTMAP_URL 配置错误（必须是完整 https URL）");
+  }
+
+  const cache = await caches.open("hostmap");
+  const cacheKey = new Request(mapUrl, { method: "GET" });
+
+  // 1) 读缓存（缓存解析失败不直接炸，走回源）
+  try {
+    const cached = await cache.match(cacheKey);
+    if (cached) return await cached.json();
+  } catch {
+    // ignore, fallback to remote
+  }
+
+  // 2) 回源更新（这里抛出的是“可读错误”）
+  await updateHostmapFromRemote(env);
+
+  // 3) 再读缓存
+  const cached2 = await cache.match(cacheKey);
+  if (cached2) return await cached2.json();
+
+  throw new Error("hostmap 更新后仍不可用");
+}
+
+/**
+ * 从远程获取并更新 hostmap 到缓存
+ * @param {{
+ *   HOSTMAP_URL?: string,
+ *   PASSWORD?: string,
+ *   CLOUDFLARE_API_URL?: string,
+ *   CLOUDFLARE_API_KEY?: string
+ * }} env
+ */
+async function updateHostmapFromRemote(env) {
+  const raw = getConfigValue(env, "HOSTMAP_URL");
+  if (!raw) throw new Error("HOSTMAP_URL 未配置");
+
+  let mapUrl;
+  try {
+    mapUrl = normalizeUrl(raw);
+    new URL(mapUrl);
+  } catch {
+    throw new Error("HOSTMAP_URL 配置错误（必须是完整 https URL）");
+  }
+
+  let resp;
+  try {
+    resp = await fetch(mapUrl);
+  } catch {
+    throw new Error("HOSTMAP_URL 拉取失败（网络错误）");
+  }
+
+  if (!resp.ok) {
+    throw new Error(`HOSTMAP_URL 拉取失败（HTTP ${resp.status}）`);
+  }
+
+  let newHostmap;
+  try {
+    newHostmap = await resp.json();
+  } catch {
+    throw new Error("HOSTMAP_URL 返回不是合法 JSON");
+  }
+
+  if (typeof newHostmap !== "object" || newHostmap === null) {
+    throw new Error("hostmap JSON 必须是对象");
+  }
+
+  const cache = await caches.open("hostmap");
+  const cacheKey = new Request(mapUrl, { method: "GET" });
+
+  const hostmapResponse = new Response(JSON.stringify(newHostmap), {
+    headers: {
+      "Content-Type": "application/json; charset=UTF-8",
+      "Cache-Control": `public, s-maxage=${HOSTMAP_CACHE_TTL}`,
     },
+  });
 
-    async getHostmap() {
-      if (_hostmap !== undefined) return _hostmap;
+  await cache.put(cacheKey, hostmapResponse);
+}
 
-      const hostmapJson = await env.KV_CONFIG.get("hostmap", { type: "text" });
-      if (!hostmapJson) {
-        _hostmap = null;
-        return _hostmap;
-      }
+/**
+ * 从 Cloudflare API 拉取自定义域名列表（仅返回 name）
+ * @param {{
+ *   HOSTMAP_URL?: string,
+ *   PASSWORD?: string,
+ *   CLOUDFLARE_API_URL?: string,
+ *   CLOUDFLARE_API_KEY?: string
+ * }} env
+ * @returns {Promise<string[]>}
+ */
+async function fetchCustomDomains(env) {
+  const raw = getConfigValue(env, "CLOUDFLARE_API_URL");
+  const apiKey = getConfigValue(env, "CLOUDFLARE_API_KEY");
 
-      try {
-        const parsed = JSON.parse(hostmapJson);
-        if (typeof parsed !== "object" || parsed === null) {
-          _hostmap = null;
-          return _hostmap;
-        }
-        _hostmap = parsed;
-        return _hostmap;
-      } catch {
-        _hostmap = null;
-        return _hostmap;
-      }
-    },
-  };
+  if (!raw) throw new Error("CLOUDFLARE_API_URL 未配置");
+  if (!apiKey) throw new Error("CLOUDFLARE_API_KEY 未配置");
+
+  let apiUrl;
+  try {
+    apiUrl = normalizeUrl(raw);
+    new URL(apiUrl);
+  } catch {
+    throw new Error("CLOUDFLARE_API_URL 配置错误（必须是完整 https URL）");
+  }
+
+  let resp;
+  try {
+    resp = await fetch(apiUrl, {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+    });
+  } catch {
+    throw new Error("Cloudflare API 拉取失败（网络错误）");
+  }
+
+  if (!resp.ok) {
+    throw new Error(`Cloudflare API 拉取失败（HTTP ${resp.status}）`);
+  }
+
+  let payload;
+  try {
+    payload = await resp.json();
+  } catch {
+    throw new Error("Cloudflare API 返回不是合法 JSON");
+  }
+
+  const result = Array.isArray(payload?.result) ? payload.result : [];
+  return result
+    .map(item => (typeof item?.name === "string" ? item.name.trim() : ""))
+    .filter(Boolean);
 }
 
 // =====================
@@ -246,43 +393,21 @@ function textResponse(text, status = 200, extraHeaders = {}) {
   });
 }
 
-/**
- * 解析 target，支持：
- * - "example.com"
- * - "1.2.3.4"
- * - "example.com:8080"
- * - "1.2.3.4:8080"
- * - "http://example.com:8080"
- * - "https://example.com"
- *
- * 规则：
- * - 若显式提供 http/https，则优先使用
- * - 否则：有端口 => http；无端口 => https
- *
- * @param {string} raw
- * @returns {{ protocol: 'http'|'https', hostname: string, port: string|null }}
- */
 function parseTarget(raw) {
   const s = String(raw).trim();
 
-  // 显式 scheme：优先使用
   if (/^https?:\/\//i.test(s)) {
     const u = new URL(s);
     let hostname = u.hostname;
-
-    // 如果 URL 里写的是 IPv4，也转成 sslip.io
     if (isIPv4(hostname)) {
       hostname = `${hostname.replace(/\./g, "-")}.sslip.io`;
     }
-
     const protocol = u.protocol === "http:" ? "http" : "https";
     return { protocol, hostname, port: u.port ? u.port : null };
   }
 
-  // host[:port]
   let hostname = s;
   let port = null;
-
   const lastColon = s.lastIndexOf(":");
   if (lastColon > -1) {
     const maybePort = s.slice(lastColon + 1);
@@ -293,54 +418,29 @@ function parseTarget(raw) {
     }
   }
 
-  // ⭐ 裸 IPv4：自动转成 xxx-xxx-xxx-xxx.sslip.io
   if (isIPv4(hostname)) {
     hostname = `${hostname.replace(/\./g, "-")}.sslip.io`;
   }
 
-  // 规则：有端口 => http；无端口 => https
   const protocol = port ? "http" : "https";
   return { protocol, hostname, port };
 }
 
-
 function corsHeaders() {
+  const allowHeaders = [
+    "Content-Type",
+    "Authorization",
+    ROUTE_TARGET_HEADER,
+    ROUTE_PASSWORD_HEADER,
+  ];
+
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers":
-      "Content-Type, Authorization, Route-Target-Cf-My, Route-Password-Cf-My",
+    "Access-Control-Allow-Headers": allowHeaders.join(", "),
   };
 }
 
-/**
- * 从 KV 中读取 map_url 并更新 hostmap
- * @param {{ KV_CONFIG: import("@cloudflare/workers-types").KVNamespace }} env
- */
-async function updateHostmapFromRemote(env) {
-  const mapUrl = await env.KV_CONFIG.get("map_url", { type: "text" });
-  if (!mapUrl) {
-    throw new Error("KV中未找到map_url配置");
-  }
-
-  const mapResponse = await fetch(mapUrl);
-  if (!mapResponse.ok) {
-    throw new Error("无法获取新的hostmap配置");
-  }
-
-  const newHostmap = await mapResponse.json();
-  if (typeof newHostmap !== "object" || newHostmap === null) {
-    throw new Error("新配置格式错误");
-  }
-
-  await env.KV_CONFIG.put("hostmap", JSON.stringify(newHostmap));
-}
-
-// =====================
-// Direct-IP workaround
-// =====================
-
-/** 判断是否为 IPv4 */
 function isIPv4(host) {
   const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (!m) return false;
